@@ -4,7 +4,6 @@ use std::convert::TryInto;
 use std::os::raw::c_int;
 
 use backtrace::Frame;
-use nix::sys::signal;
 use parking_lot::RwLock;
 
 use crate::collector::Collector;
@@ -14,6 +13,12 @@ use crate::report::ReportBuilder;
 use crate::timer::Timer;
 use crate::{MAX_DEPTH, MAX_THREAD_NAME};
 
+use winapi::um::processthreadsapi::GetCurrentProcess;
+use winapi::um::processthreadsapi::GetThreadId;
+use winapi::um::winnt::{ACCESS_MASK, HANDLE, MAXIMUM_ALLOWED};
+use winapi::shared::ntdef::{PVOID, NTSTATUS};
+use winapi::shared::minwindef::ULONG;
+
 lazy_static::lazy_static! {
     pub(crate) static ref PROFILER: RwLock<Result<Profiler>> = RwLock::new(Profiler::new());
 }
@@ -21,7 +26,6 @@ lazy_static::lazy_static! {
 pub struct Profiler {
     pub(crate) data: Collector<UnresolvedFrames>,
     sample_counter: i32,
-
     running: bool,
 }
 
@@ -56,6 +60,14 @@ impl ProfilerGuard<'_> {
         }
     }
 
+    fn unregister_signal_handler(&self) -> Result<()> {
+        // unimplemented!();
+        // let handler = signal::SigHandler::SigDfl;
+        // unsafe { signal::signal(signal::SIGPROF, handler) }?;
+
+        Ok(())
+    }
+
     /// Generate a report
     pub fn report(&self) -> ReportBuilder {
         ReportBuilder::new(&self.profiler)
@@ -73,14 +85,17 @@ impl<'a> Drop for ProfilerGuard<'a> {
                 Err(err) => log::error!("error while stopping profiler {}", err),
             },
         }
+
+        self.unregister_signal_handler()
+            .expect("Error unregistering sig handler");
     }
 }
 
-fn write_thread_name_fallback(current_thread: libc::pthread_t, name: &mut [libc::c_char]) {
+fn write_thread_name_fallback(current_thread: u128, name: &mut [libc::c_char]) {
     let mut len = 0;
     let mut base = 1;
 
-    while current_thread as u128 > base && len < MAX_THREAD_NAME {
+    while current_thread > base && len < MAX_THREAD_NAME {
         base *= 10;
         len += 1;
     }
@@ -89,7 +104,7 @@ fn write_thread_name_fallback(current_thread: libc::pthread_t, name: &mut [libc:
     while index < len && base > 1 {
         base /= 10;
 
-        name[index] = match (48 + (current_thread as u128 / base) % 10).try_into() {
+        name[index] = match (48 + (current_thread / base) % 10).try_into() {
             Ok(digit) => digit,
             Err(_) => {
                 log::error!("fail to convert thread_id to string");
@@ -101,23 +116,18 @@ fn write_thread_name_fallback(current_thread: libc::pthread_t, name: &mut [libc:
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn write_thread_name(current_thread: libc::pthread_t, name: &mut [libc::c_char]) {
+fn write_thread_name(current_thread: u128, name: &mut [libc::c_char]) {
     write_thread_name_fallback(current_thread, name);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn write_thread_name(current_thread: libc::pthread_t, name: &mut [libc::c_char]) {
-    let name_ptr = name as *mut [libc::c_char] as *mut libc::c_char;
-    let ret = unsafe { libc::pthread_getname_np(current_thread, name_ptr, MAX_THREAD_NAME) };
-
-    if ret != 0 {
-        write_thread_name_fallback(current_thread, name);
-    }
+#[link(name="ntdll")]
+extern "system" {
+    fn NtQueryInformationThread(thread: HANDLE, info_class: u32, info: PVOID, info_len: ULONG, ret_len: * mut ULONG) -> NTSTATUS;
+    fn NtGetNextThread(process: HANDLE, thread: HANDLE, access: ACCESS_MASK, attritubes: ULONG, flags: ULONG, new_thread: *mut HANDLE) -> NTSTATUS;
 }
 
-#[no_mangle]
-extern "C" fn perf_signal_handler(_signal: c_int) {
+
+pub fn perf_signal_handler() {
     if let Some(mut guard) = PROFILER.try_write() {
         if let Ok(profiler) = guard.as_mut() {
             let mut bt: [Frame; MAX_DEPTH] =
@@ -125,25 +135,35 @@ extern "C" fn perf_signal_handler(_signal: c_int) {
             let mut index = 0;
 
             unsafe {
-                backtrace::trace_unsynchronized(|frame| {
-                    if index < MAX_DEPTH {
-                        bt[index] = frame.clone();
-                        index += 1;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                let process = GetCurrentProcess();
+                let mut thread: HANDLE = std::mem::zeroed();
+                while NtGetNextThread(process, thread, MAXIMUM_ALLOWED, 0, 0,
+                    &mut thread as *mut HANDLE) == 0 {
+                    backtrace::trace_remotely_unsynchronized(
+                        |frame| {
+                            if index < MAX_DEPTH {
+                                bt[index] = frame.clone();
+                                index += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                        process,
+                        thread,
+                    );
+
+                    let current_thread_id = GetThreadId(thread) as u64;
+                    let current_thread_name = format!("Thread:{}", current_thread_id);
+
+                    profiler.sample(
+                        &bt[0..index],
+                        &current_thread_name.into_bytes(),
+                        current_thread_id,
+                    );
+                }
             }
 
-            let current_thread = unsafe { libc::pthread_self() };
-            let mut name = [0 as libc::c_char; MAX_THREAD_NAME];
-            let name_ptr = &mut name as *mut [libc::c_char] as *mut libc::c_char;
-
-            write_thread_name(current_thread, &mut name);
-
-            let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
-            profiler.sample(&bt[0..index], name.to_bytes(), current_thread as u64);
         }
     }
 }
@@ -164,7 +184,6 @@ impl Profiler {
         if self.running {
             Err(Error::Running)
         } else {
-            self.register_signal_handler()?;
             self.running = true;
 
             Ok(())
@@ -182,7 +201,6 @@ impl Profiler {
     pub fn stop(&mut self) -> Result<()> {
         log::info!("stopping cpu profiler");
         if self.running {
-            self.unregister_signal_handler()?;
             self.init()?;
 
             Ok(())
@@ -191,26 +209,11 @@ impl Profiler {
         }
     }
 
-    fn register_signal_handler(&self) -> Result<()> {
-        let handler = signal::SigHandler::Handler(perf_signal_handler);
-        unsafe { signal::signal(signal::SIGPROF, handler) }?;
-
-        Ok(())
-    }
-
-    fn unregister_signal_handler(&self) -> Result<()> {
-        let handler = signal::SigHandler::SigDfl;
-        unsafe { signal::signal(signal::SIGPROF, handler) }?;
-
-        Ok(())
-    }
-
     // This function has to be AS-safe
     pub fn sample(&mut self, backtrace: &[Frame], thread_name: &[u8], thread_id: u64) {
         let frames = UnresolvedFrames::new(backtrace, thread_name, thread_id);
         self.sample_counter += 1;
-
-        if let Ok(()) = self.data.add(frames, 1) {}
+        if let Ok(()) = self.data.add(frames, 1) {};
     }
 }
 
@@ -220,32 +223,32 @@ mod tests {
     use std::cell::RefCell;
     use std::ffi::c_void;
 
-    extern "C" {
-        static mut __malloc_hook: Option<extern "C" fn(size: usize) -> *mut c_void>;
+    // extern "C" {
+    //     static mut __malloc_hook: Option<extern "C" fn(size: usize) -> *mut c_void>;
 
-        fn malloc(size: usize) -> *mut c_void;
-    }
+    //     fn malloc(size: usize) -> *mut c_void;
+    // }
 
-    thread_local! {
-        static FLAG: RefCell<bool> = RefCell::new(false);
-    }
+    // thread_local! {
+    //     static FLAG: RefCell<bool> = RefCell::new(false);
+    // }
 
-    extern "C" fn malloc_hook(size: usize) -> *mut c_void {
-        unsafe {
-            __malloc_hook = None;
-        }
+    // extern "C" fn malloc_hook(size: usize) -> *mut c_void {
+    //     unsafe {
+    //         __malloc_hook = None;
+    //     }
 
-        FLAG.with(|flag| {
-            flag.replace(true);
-        });
-        let p = unsafe { malloc(size) };
+    //     FLAG.with(|flag| {
+    //         flag.replace(true);
+    //     });
+    //     let p = unsafe { malloc(size) };
 
-        unsafe {
-            __malloc_hook = Some(malloc_hook);
-        }
+    //     unsafe {
+    //         __malloc_hook = Some(malloc_hook);
+    //     }
 
-        p
-    }
+    //     p
+    // }
 
     #[inline(never)]
     fn is_prime_number(v: usize, prime_numbers: &[usize]) -> bool {
@@ -287,29 +290,29 @@ mod tests {
         prime_numbers
     }
 
-    #[test]
-    fn malloc_free() {
-        trigger_lazy();
+    // #[test]
+    // fn malloc_free() {
+    //     trigger_lazy();
 
-        let prime_numbers = prepare_prime_numbers();
+    //     let prime_numbers = prepare_prime_numbers();
 
-        let mut _v = 0;
+    //     let mut _v = 0;
 
-        unsafe {
-            __malloc_hook = Some(malloc_hook);
-        }
-        for i in 2..50000 {
-            if is_prime_number(i, &prime_numbers) {
-                _v += 1;
-                perf_signal_handler(27);
-            }
-        }
-        unsafe {
-            __malloc_hook = None;
-        }
+    //     unsafe {
+    //         __malloc_hook = Some(malloc_hook);
+    //     }
+    //     for i in 2..50000 {
+    //         if is_prime_number(i, &prime_numbers) {
+    //             _v += 1;
+    //             perf_signal_handler(27);
+    //         }
+    //     }
+    //     unsafe {
+    //         __malloc_hook = None;
+    //     }
 
-        FLAG.with(|flag| {
-            assert_eq!(*flag.borrow(), false);
-        });
-    }
+    //     FLAG.with(|flag| {
+    //         assert_eq!(*flag.borrow(), false);
+    //     });
+    // }
 }

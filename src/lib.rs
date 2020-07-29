@@ -25,7 +25,7 @@
 pub const MAX_DEPTH: usize = 32;
 
 /// Define the MAX supported thread name length. TODO: make this variable mutable.
-pub const MAX_THREAD_NAME: usize = 16;
+pub const MAX_THREAD_NAME: usize = 32;
 
 mod collector;
 mod error;

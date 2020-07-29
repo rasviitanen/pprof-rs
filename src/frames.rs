@@ -213,17 +213,18 @@ impl From<UnresolvedFrames> for Frames {
 
         frames.slice().frames.iter().for_each(|frame| {
             let mut symbols = Vec::new();
-
             backtrace::resolve_frame(frame, |symbol| {
                 let symbol = Symbol::from(symbol);
-                if &symbol.name() == "perf_signal_handler" {
-                    *is_signal_handler = true;
-                }
+                // if &symbol.name() == "pprof::profiler::perf_signal_handler" {
+                //     *is_signal_handler = true;
+                // }
 
                 symbols.push(symbol);
             });
 
-            if !symbols.is_empty() && *after_signal_handler > 0 {
+            if !symbols.is_empty()
+            /* && *after_signal_handler > 0 */
+            {
                 fs.push(symbols);
             }
 
@@ -232,13 +233,13 @@ impl From<UnresolvedFrames> for Frames {
             }
         });
 
+        let thread_name = unsafe {
+            String::from_utf8_unchecked(frames.thread_name[0..frames.thread_name_length].to_vec())
+        };
+
         Self {
             frames: fs,
-            thread_name: unsafe {
-                String::from_utf8_unchecked(
-                    frames.thread_name[0..frames.thread_name_length].to_vec(),
-                )
-            },
+            thread_name,
             thread_id: frames.thread_id,
         }
     }

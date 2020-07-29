@@ -56,6 +56,7 @@ impl<'a> ReportBuilder<'a> {
                     let count = entry.count;
                     if count > 0 {
                         let mut key = Frames::from(entry.item.clone());
+
                         if let Some(processor) = &self.frames_post_processor {
                             processor(&mut key);
                         }

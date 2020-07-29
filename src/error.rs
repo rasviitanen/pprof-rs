@@ -2,8 +2,8 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{0}")]
-    NixError(#[from] nix::Error),
+    #[error("Unix error, whatever")]
+    NixError,
     #[error("{0}")]
     IoError(#[from] std::io::Error),
     #[error("create profiler error")]

@@ -10,15 +10,18 @@ documentation = "https://docs.rs/pprof/"
 readme = "README.md"
 
 [features]
+default = ["inferno"]
 flamegraph = ["inferno"]
 protobuf = ["prost", "prost-derive", "prost-build"]
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
 [dependencies]
-backtrace = "0.3"
+backtrace = { path = "../backtrace-rs" }
 lazy_static = "1.4"
 libc = "^0.2.66"
 log = "0.4"
-nix = "0.17"
 parking_lot = "0.11"
 symbolic-demangle = "7.4"
 tempfile = "3.1"
@@ -27,7 +30,6 @@ thiserror = "1.0"
 inferno = { version = "0.10", default-features = false, features = ["nameattr"], optional = true }
 prost = { version = "0.6", optional = true }
 prost-derive = { version = "0.6", optional = true }
-
 [dev-dependencies]
 criterion = "0.3"
 rand = "0.7.2"
